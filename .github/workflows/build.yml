@@ -1,0 +1,103 @@
+name: Build patched Snapmaker Orca AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release to publish the AppImage under (leave empty to only upload an artifact)
+        type: string
+        default: ''
+
+env:
+  SNAPMAKER_REF: v2.4.0          # upstream tag that is patched
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Checkout this repository (patches)
+        uses: actions/checkout@v5
+        with:
+          path: build-repo
+
+      - name: Checkout Snapmaker Orca ${{ env.SNAPMAKER_REF }}
+        uses: actions/checkout@v5
+        with:
+          repository: Snapmaker/OrcaSlicer
+          ref: ${{ env.SNAPMAKER_REF }}
+          path: orca
+
+      - name: Apply patches
+        working-directory: orca
+        run: |
+          echo "SNAPMAKER_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          for p in ../build-repo/patches/*.patch; do echo "Applying $p"; git apply --verbose "$p"; done
+          git diff --stat
+
+      - name: Install build dependencies
+        working-directory: orca
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf build-essential cmake curl eglexternalplatform-dev \
+            extra-cmake-modules file git libcairo2-dev libcurl4-openssl-dev libdbus-1-dev libglew-dev libglu1-mesa-dev \
+            libgstreamer1.0-dev libgstreamerd-3-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev \
+            libgtk-3-dev libmspack-dev libsecret-1-dev libsoup2.4-dev libssl-dev libudev-dev libwayland-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-dev locales locales-all m4 pkgconf sudo wayland-protocols wget libfuse2t64 \
+            gstreamer1.0-plugins-bad libunwind-dev texinfo
+          sudo ./build_linux.sh -ur
+          sudo chown -R "$USER" ./
+
+      - name: Build dependencies
+        working-directory: orca
+        run: ./build_linux.sh -dr && df -h /
+
+      - name: Build slicer and AppImage
+        working-directory: orca
+        run: |
+          ./build_linux.sh -isr
+          ver=$(grep 'set(Snapmaker_VERSION' version.inc | cut -d '"' -f2)
+          out="Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V${ver}_cli-fix.AppImage"
+          mv "build/Snapmaker_Orca_Linux_V${ver}.AppImage" "../$out"
+          chmod +x "../$out"
+          cd .. && sha256sum "$out" > SHA256SUMS && cat SHA256SUMS
+          echo "APPIMAGE=$out" >> "$GITHUB_ENV"
+
+      - name: Smoke-test the CLI headless
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a "./$APPIMAGE" --appimage-extract-and-run --help | head -5 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapmaker-orca-cli-fix
+          path: |
+            ${{ env.APPIMAGE }}
+            SHA256SUMS
+
+      - name: Publish release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          Snapmaker Orca built from [Snapmaker/OrcaSlicer@${SNAPMAKER_REF}](https://github.com/Snapmaker/OrcaSlicer/tree/${SNAPMAKER_SHA}) (\`${SNAPMAKER_SHA}\`)
+          with the patches in [\`patches/\`](https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/patches) applied
+          (Snapmaker/OrcaSlicer#839: headless CLI slicing fixes). Built by workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
+
+          \`\`\`
+          $(cat SHA256SUMS)
+          \`\`\`
+
+          Licensed under the GNU AGPL-3.0, like the upstream source.
+          EOF
+          gh release create "${{ inputs.release_tag }}" "$APPIMAGE" SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --title "Snapmaker Orca ${SNAPMAKER_REF} + CLI fixes (${{ inputs.release_tag }})" --notes-file notes.md --target "$GITHUB_SHA"

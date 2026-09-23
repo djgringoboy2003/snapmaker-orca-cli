@@ -1,0 +1,134 @@
+From 7f91a18d5a358edf2be5d5c1a300b6dcd87bf633 Mon Sep 17 00:00:00 2001
+From: Kuzuri <me@kuzuriao.com>
+Date: Wed, 9 Sep 2026 01:58:48 -0400
+Subject: [PATCH 1/2] Fix CLI rejecting every project file on the version check
+
+The CLI compares a loaded file's version against SLIC3R_VERSION, which is a
+legacy constant inherited from BambuStudio (01.10.01.50 in common_func.hpp)
+and does not track the product version (Snapmaker_VERSION, 2.3.6). Since real
+project files report major version 2 and the constant reports major 1, the
+major versions never matched and every file was rejected with
+
+  Version Check: File Version 2.3.0.6 not supported by current cli version
+  01.10.01.50
+
+including files saved by Snapmaker Orca itself.
+
+The comparison was also wrong in the other direction: "cli_ver.maj() !=
+file_version.maj() || cli_ver.min() < file_version.min()" rejects files older
+than the application as well as newer ones, and evaluates the minor version
+across differing major versions.
+
+Match upstream OrcaSlicer (src/OrcaSlicer.cpp), which compares against its
+product version and only rejects files newer than the application. Also report
+the product version in the error message rather than the legacy constant.
+---
+ src/Snapmaker_Orca.cpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/Snapmaker_Orca.cpp b/src/Snapmaker_Orca.cpp
+index b4f9b5cde804..16ca94456032 100644
+--- a/src/Snapmaker_Orca.cpp
++++ b/src/Snapmaker_Orca.cpp
+@@ -1427,9 +1427,13 @@ int CLI::run(int argc, char **argv)
+                         BOOST_LOG_TRIVIAL(info) << "object "<<o->name <<", id :" << o->id().id << ", from bbl 3mf\n";
+                     }*/
+ 
+-                    Semver cli_ver = *Semver::parse(SLIC3R_VERSION);
+-                    if (!allow_newer_file && ((cli_ver.maj() != file_version.maj()) || (cli_ver.min() < file_version.min()))){
+-                        BOOST_LOG_TRIVIAL(error) << boost::format("Version Check: File Version %1% not supported by current cli version %2%")%file_version.to_string() %SLIC3R_VERSION;
++                    // Snapmaker_Orca: match upstream OrcaSlicer here. Two problems with the old code:
++                    // SLIC3R_VERSION is a legacy constant inherited from BambuStudio (01.10.01.50) that
++                    // does not track the product version, so every 2.x project file was rejected; and
++                    // the comparison rejected older files too, rather than only newer ones.
++                    Semver cli_ver = *Semver::parse(Snapmaker_VERSION);
++                    if (!allow_newer_file && ((cli_ver.maj() < file_version.maj()) || ((cli_ver.maj() == file_version.maj()) && (cli_ver.min() < file_version.min())))){
++                        BOOST_LOG_TRIVIAL(error) << boost::format("Version Check: File Version %1% not supported by current cli version %2%")%file_version.to_string() %Snapmaker_VERSION;
+                         record_exit_reson(outfile_dir, CLI_FILE_VERSION_NOT_SUPPORTED, 0, cli_errors[CLI_FILE_VERSION_NOT_SUPPORTED], sliced_info);
+                         flush_and_exit(CLI_FILE_VERSION_NOT_SUPPORTED);
+                     }
+
+From 996b9736af6c3be043389fccc78cf69e8baafe49 Mon Sep 17 00:00:00 2001
+From: Kuzuri <me@kuzuriao.com>
+Date: Wed, 9 Sep 2026 01:58:48 -0400
+Subject: [PATCH 2/2] Fix two CLI crashes calling GUI-only code with no
+ application object
+
+PartPlate reaches wxGetApp() on the headless path in two places. wxGetApp()
+dereferences the wx application object, which does not exist in CLI mode, so
+slicing from the command line dies with SIGSEGV before producing output.
+
+1) PartPlate::generate_plate_name_texture() calls wxGetApp().em_unit() to
+   scale the plate name font:
+
+     stop reason = EXC_BAD_ACCESS (code=1, address=0x398)
+     frame #0: Slic3r::GUI::GUI_App::em_unit(this=0x0000000000000000) const
+               at GUI_App.hpp:517
+
+   Upstream OrcaSlicer guards this function by returning early when there is
+   no 3D canvas, since there is nothing to generate a texture for in that
+   case. Do the same, additionally null checking m_partplate_list and
+   m_plater before dereferencing them: the CLI path reaches this function
+   with a null Plater, so fetching the canvas directly would crash inside the
+   guard itself. The canvas is then reused later in the function instead of
+   being fetched a second time, which also matches upstream.
+
+2) expand_plate_extruders() calls wxGetApp().filaments_cnt() and
+   wxGetApp().preset_bundle to expand virtual extruder ids for mixed
+   filaments, and is reached from PartPlate::get_extruders():
+
+     stop reason = EXC_BAD_ACCESS (code=1, address=0x868)
+     frame #0: Slic3r::GUI::GUI_App::filaments_cnt(this=0x0000000000000000)
+               const at GUI_App.cpp:6832
+
+   Return early when there is no application object. There is no GUI preset
+   bundle to expand ids against in CLI mode, so they are left as they are,
+   which is what happened before mixed filament support was added. This code
+   has no upstream counterpart.
+
+Both guards only trigger when running headless, so the GUI is unaffected:
+there is always a 3D canvas and an application object with a window open.
+---
+ src/slic3r/GUI/PartPlate.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/slic3r/GUI/PartPlate.cpp b/src/slic3r/GUI/PartPlate.cpp
+index 9b8f578e5f7e..33f6a28fc7e2 100644
+--- a/src/slic3r/GUI/PartPlate.cpp
++++ b/src/slic3r/GUI/PartPlate.cpp
+@@ -1348,6 +1348,12 @@ int PartPlate::picking_id_component(int idx) const
+ 
+ static void expand_plate_extruders(std::vector<int>& ids)
+ {
++	// wxGetApp() dereferences the wx application object, which does not exist when running
++	// headless (CLI). There is no GUI preset bundle to expand virtual extruder ids against
++	// in that case, so leave the ids as they are rather than crashing.
++	if (wxTheApp == nullptr)
++		return;
++
+ 	const size_t num_physical = static_cast<size_t>(std::max(wxGetApp().filaments_cnt(), 0));
+ 	if (num_physical > 0) {
+ 		wxGetApp().preset_bundle->mixed_filaments.expand_virtual_extruder_ids(ids, num_physical);
+@@ -1913,6 +1919,14 @@ Vec3d PartPlate::get_center_origin()
+ 
+ void PartPlate::generate_plate_name_texture()
+ {
++	// There is no texture to generate without a 3D canvas, and in CLI mode wxGetApp() has no
++	// application object, so the em_unit() call below would dereference null. Matches upstream.
++	auto canvas = (this->m_partplate_list != nullptr && this->m_partplate_list->m_plater != nullptr)
++	                  ? this->m_partplate_list->m_plater->get_view3D_canvas3D()
++	                  : nullptr;
++	if (canvas == nullptr)
++		return;
++
+     m_plate_name_icon.reset();
+ 
+ 	// generate m_name_texture texture from m_name with generate_from_text_string
+@@ -1950,7 +1964,6 @@ void PartPlate::generate_plate_name_texture()
+     if (!init_model_from_poly(m_plate_name_icon, poly, GROUND_Z))
+         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "Unable to generate geometry buffers for icons\n";
+ 
+-	auto canvas = this->m_partplate_list->m_plater->get_view3D_canvas3D();
+     canvas->remove_raycasters_for_picking(SceneRaycaster::EType::Bed, picking_id_component(6));
+     calc_vertex_for_plate_name_edit_icon(&m_name_texture, 0, m_plate_name_edit_icon);
+     register_model_for_picking(*canvas, m_plate_name_edit_icon, picking_id_component(6));
