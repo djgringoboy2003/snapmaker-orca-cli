@@ -91,7 +91,7 @@ jobs:
           cat > notes.md <<EOF
           Snapmaker Orca built from [Snapmaker/OrcaSlicer@${SNAPMAKER_REF}](https://github.com/Snapmaker/OrcaSlicer/tree/${SNAPMAKER_SHA}) (\`${SNAPMAKER_SHA}\`)
           with the patches in [\`patches/\`](https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/patches) applied
-          (Snapmaker/OrcaSlicer#839: headless CLI slicing fixes). Built by workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
+          (Snapmaker/OrcaSlicer#839: headless CLI slicing fixes; backport of OrcaSlicer/OrcaSlicer#14166: compile G-code processor regexes once). Built by workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
 
           \`\`\`
           $(cat SHA256SUMS)

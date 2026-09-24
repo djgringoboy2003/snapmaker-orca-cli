@@ -1,0 +1,71 @@
+From 5ed8f5ef258898a4006677bab8a3f2e412adedec Mon Sep 17 00:00:00 2001
+From: Grant Harkness <64664463+grant0013@users.noreply.github.com>
+Date: Tue, 16 Jun 2026 16:51:27 +0100
+Subject: [PATCH] perf(GCodeProcessor): stop recompiling std::regex on every
+ g-code line (backport of OrcaSlicer/OrcaSlicer#14166)
+
+Backport of upstream OrcaSlicer commit 5ed8f5ef2588 (#14166) to Snapmaker
+Orca v2.4.0, which forked before it landed. Snapmaker v2.4.0 has no
+process_SET_PRESSURE_ADVANCE(), so that hunk is omitted; the other four
+patterns are changed exactly as upstream.
+
+process_SET_VELOCITY_LIMIT() constructed three std::regex objects from
+scratch on every call, and Klipper-flavor g-code (Snapmaker U1) contains
+SET_VELOCITY_LIMIT on a large share of lines. Hoist the patterns to
+function-local static const std::regex so they compile once. Generated
+g-code is unchanged.
+
+Measured on Snapmaker v2.4.0 with a 4-colour mixed-filament U1 project:
+perf attributes 69% of the G-code generation stage to this function,
+almost all of it regex compilation (~310 us per SET_VELOCITY_LIMIT line).
+---
+ src/libslic3r/GCode/GCodeProcessor.cpp | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/libslic3r/GCode/GCodeProcessor.cpp b/src/libslic3r/GCode/GCodeProcessor.cpp
+index 923e2d0..37a8ceb 100644
+--- a/src/libslic3r/GCode/GCodeProcessor.cpp
++++ b/src/libslic3r/GCode/GCodeProcessor.cpp
+@@ -1953,7 +1953,7 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
+     // Orca: Integrate filament consumption for purging performed to an external device and controlled via macros
+     // (eg. Happy Hare) in the filament consumption stats.
+     if (boost::starts_with(comment, GCodeProcessor::External_Purge_Tag)) {
+-        std::regex numberRegex(R"(\d+\.\d+)");
++        static const std::regex numberRegex(R"(\d+\.\d+)");
+         std::smatch match;
+         std::string line(comment);
+         if (std::regex_search(line, match, numberRegex)) {
+@@ -3828,9 +3828,9 @@ void GCodeProcessor::process_M205(const GCodeReader::GCodeLine& line)
+ void GCodeProcessor::process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& line)
+ {
+     // handle SQUARE_CORNER_VELOCITY
+-    std::regex pattern("\\sSQUARE_CORNER_VELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
++    static const std::regex square_corner_velocity_pattern("\\sSQUARE_CORNER_VELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
+     std::smatch matches;
+-    if (std::regex_search(line.raw(), matches, pattern) && matches.size() == 2) {
++    if (std::regex_search(line.raw(), matches, square_corner_velocity_pattern) && matches.size() == 2) {
+         float _jerk = 0;
+         try
+         {
+@@ -3843,8 +3843,8 @@ void GCodeProcessor::process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& li
+         }
+     }
+ 
+-    pattern = std::regex("\\sACCEL\\s*=\\s*([0-9]*\\.*[0-9]*)");
+-    if (std::regex_search(line.raw(), matches, pattern) && matches.size() == 2) {
++    static const std::regex accel_pattern("\\sACCEL\\s*=\\s*([0-9]*\\.*[0-9]*)");
++    if (std::regex_search(line.raw(), matches, accel_pattern) && matches.size() == 2) {
+         float _accl = 0;
+         try
+         {
+@@ -3857,8 +3857,8 @@ void GCodeProcessor::process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& li
+         }
+     }
+ 
+-    pattern = std::regex("\\sVELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
+-    if (std::regex_search(line.raw(), matches, pattern) && matches.size() == 2) {
++    static const std::regex velocity_pattern("\\sVELOCITY\\s*=\\s*([0-9]*\\.*[0-9]*)");
++    if (std::regex_search(line.raw(), matches, velocity_pattern) && matches.size() == 2) {
+         float _speed = 0;
+         try
+         {
